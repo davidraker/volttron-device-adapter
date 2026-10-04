@@ -34,28 +34,52 @@ def _uai(value) -> list[str]:
     return list(value)
 
 
-class BridgeConfig(BaseModel):
-    """One direction of mirroring: every publication of ``source`` is transformed into the format of ``target``
-    (the chain the presentation service chooses for the fields the message carries) and written to it."""
+class EndConfig(BaseModel):
+    """One end of a bridge: a UAI the presentation service knows. A *device* end (the default) is the canonical device
+    the UAI leads to, read from its publications or written through the driver. A *bus* end is the UAI itself as a
+    topic on the VOLTTRON bus carrying messages in the UAI's (alias) format: an OpenFMB profile topic, read from or
+    published to, so OpenFMB-aware agents and the Message Bus Adapter in relay mode can take part."""
     model_config = ConfigDict(validate_assignment=True, populate_by_name=True, extra='forbid')
 
-    name: str | None = Field(default=None, description='Stable handle for the bridge; defaults to "<source>><target>".')
-    source: list[str] = Field(description='UAI of the resource whose publications are bridged (its canonical resource'
-                                          ' must have a publication_topic).')
-    target: list[str] = Field(description='UAI of the device written (its canonical resource must have an rpc_topic).')
-    enabled: bool = True
-    points: list[str] | None = Field(default=None, description='Only these source points are bridged (all by default).')
-    write_unchanged: bool = Field(default=False, description='Write a point again even when its value is the one last'
-                                                             ' written to the target (by default only changes are written).')
+    uai: list[str]
+    bus: bool = Field(default=False, description='Treat the UAI as a topic on the VOLTTRON bus rather than as a device.')
+    topic: str | None = Field(default=None, description='Bus end only: the topic, when it is not the UAI joined with "/".')
 
-    @field_validator('source', 'target', mode='before')
+    @model_validator(mode='before')
+    @classmethod
+    def _bare_uai(cls, value):
+        return value if isinstance(value, dict) else {'uai': value}
+
+    @field_validator('uai', mode='before')
     @classmethod
     def _as_uai(cls, value):
         return _uai(value)
 
     @property
     def key(self) -> str:
-        return self.name or f'{"/".join(self.source)}>{"/".join(self.target)}'
+        return '/'.join(self.uai)
+
+    @property
+    def bus_topic(self) -> str:
+        return self.topic or '/'.join(self.uai)
+
+
+class BridgeConfig(BaseModel):
+    """One direction of mirroring: every message of ``source`` is transformed into the format of ``target`` (the chain
+    the presentation service chooses for the fields the message carries) and written to it, or published on it."""
+    model_config = ConfigDict(validate_assignment=True, populate_by_name=True, extra='forbid')
+
+    name: str | None = Field(default=None, description='Stable handle for the bridge; defaults to "<source>><target>".')
+    source: EndConfig = Field(description='Where messages come from: a device (its publications) or a bus topic.')
+    target: EndConfig = Field(description='Where they go: a device (written through the driver) or a bus topic (published).')
+    enabled: bool = True
+    points: list[str] | None = Field(default=None, description='Only these source points are bridged (device sources; all by default).')
+    write_unchanged: bool = Field(default=False, description='Write a point again even when its value is the one last'
+                                                             ' written to the target (by default only changes are written).')
+
+    @property
+    def key(self) -> str:
+        return self.name or f'{self.source.key}>{self.target.key}'
 
 
 class DeviceAdapterConfig(BaseModel):

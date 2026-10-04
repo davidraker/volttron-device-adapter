@@ -52,16 +52,32 @@ The presentation service only answers mapping and transformation questions (`res
 }
 ```
 
-`source` and `target` are UAIs (a list of segments, or one `/`-joined string). The source must
-lead to a canonical resource with a `publication_topic`, the target to one with an `rpc_topic`.
+`source` and `target` are UAIs (a list of segments, or one `/`-joined string). A plain UAI is a
+*device* end: the source must lead to a canonical resource with a `publication_topic`, the target to
+one with an `rpc_topic`. An end written as `{"uai": ..., "bus": true}` is a *bus* end: the UAI itself
+is a topic on the VOLTTRON bus carrying messages in the UAI's alias format, an OpenFMB profile topic
+such as `openfmb/solarmodule/SolarControlProfile/<mRID>`. A bus source is subscribed to (messages
+published by this agent itself are ignored); a bus target is published to with the headers of
+`interoperability.openfmb_bus` (content type, protobuf message name, origin). This is how OpenFMB
+lives on the VOLTTRON bus: the Message Bus Adapter in `relay` mode re-serialises those topics to and
+from the foreign bus, and any OpenFMB-aware agent can publish or consume them.
+
+```json
+{"bridges": [
+    {"name": "pv_reading", "source": "site1/pv_inverter",
+     "target": {"uai": "openfmb/solarmodule/SolarReadingProfile/7d1a2b3c-0000-4000-8000-000000000001", "bus": true}},
+    {"name": "pv_control", "source": {"uai": "openfmb/solarmodule/SolarControlProfile/7d1a2b3c-0000-4000-8000-000000000001", "bus": true},
+     "target": "site1/pv_inverter"}
+]}
+```
 Served devices (a server the platform runs) must be declared with their own device format,
 generated with the discovery tools' `--served` flag, so the write edges into their inputs exist.
 
 ## RPC
 
 - `list_bridges()`: the configured bridges, their resolved ends and the chains used so far.
-- `relay_message(bridge, message)`: push one device message through a bridge as if its source had
-  published it.
+- `relay_message(bridge, message, headers=None)`: push one message through a bridge as if its source
+  had published it.
 - `write(uai, message, as_format=None)`: write a protocol message (in `as_format`, or the format
   of the outermost alias in `uai`) to the device the UAI leads to. Returns the write result with the
   chain's path and retention.
@@ -70,5 +86,6 @@ generated with the discovery tools' `--served` flag, so the write edges into the
 
 `pytest tests` runs the unit tests (VOLTTRON stubbed). `tests/test_e2e_matrix.py` runs the
 interoperability service's end-to-end matrix with this agent doing the writes for every
-device-to-device path; it needs the modular driver stack and the Modbus, DNP3 and 2030.5 proxies
+device-to-device path, and once more with OpenFMB on the VOLTTRON bus (this agent's bus ends plus the
+Message Bus Adapter in relay mode) carrying the OpenFMB paths; it needs the modular driver stack and the Modbus, DNP3 and 2030.5 proxies
 importable and is skipped otherwise.

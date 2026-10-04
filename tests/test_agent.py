@@ -13,13 +13,22 @@ TARGET = {'data_format': 'fake_mirror', 'publication_topic': 'devices/site1/mirr
 # fake_pv -> fake_mirror: W doubles, Hz is copied; the chain is what the service's lookup_scored would return.
 CHAIN = [{'#': 'transform(device_values())', 'M_W': 'transform[W](multiple(2))', 'M_Hz': 'transform[Hz]()'}]
 REVERSE = [{'#': 'transform(device_values())', 'W': 'transform[M_W](multiple(0.5))', 'Hz': 'transform[M_Hz]()'}]
+TO_PROFILE = [{'#': 'transform(device_values())', 'solarReading': {'readingMMXU': {'W': {'net': {'cVal': {'mag': 'transform[W]()'}}}}},
+               'solarInverter': {'conductingEquipment': {'mRID': "param('mrid')"}}}]
+FROM_PROFILE = [{'LimPct': 'transform[solarControl, limitW]()'}]
+READING = ['openfmb', 'solarmodule', 'SolarReadingProfile', 'm-1']
+CONTROL = ['openfmb', 'solarmodule', 'SolarControlProfile', 'm-1']
 
 
 class FakeVolttron:
     """Records RPCs, subscriptions and publishes; answers resolve and set_multiple_points."""
     def __init__(self):
-        self.calls, self.subscriptions, self.published = [], {}, []
-        self.resources = {('site1', 'pv'): SOURCE, ('site1', 'mirror'): TARGET}
+        self.calls, self.subscriptions, self.published, self.published_with_headers = [], {}, [], []
+        self.resources = {('site1', 'pv'): SOURCE, ('site1', 'mirror'): TARGET,
+                          tuple(READING): {**SOURCE, 'target_format': 'openfmb.solar.reading', 'parameters': {'mrid': 'm-1'},
+                                           'codec': {'encoding': 'protobuf', 'proto': 'solarmodule.SolarReadingProfile'}},
+                          tuple(CONTROL): {**SOURCE, 'target_format': 'openfmb.solar.control', 'parameters': {'mrid': 'm-1'},
+                                           'codec': {'encoding': 'protobuf', 'proto': 'solarmodule.SolarControlProfile'}}}
         self.driver_errors = {}
 
     def rpc_call(self, peer, method, *args, **kwargs):
@@ -32,6 +41,11 @@ class FakeVolttron:
                 resource.update(target_format=kwargs['as_format'], transform=chain, path=[kwargs['as_format'], resource['data_format']],
                                 retention=0.5)
             reply.get.return_value = resource
+        elif method == 'transform_chain':
+            src, dst, fields = args
+            chain = {('fake_pv', 'fake_mirror'): CHAIN, ('fake_mirror', 'fake_pv'): REVERSE,
+                     ('fake_pv', 'openfmb.solar.reading'): TO_PROFILE, ('openfmb.solar.control', 'fake_pv'): FROM_PROFILE}[(src, dst)]
+            reply.get.return_value = {'transform': chain, 'path': [src, dst], 'retention': 0.5}
         elif method == 'set_multiple_points':
             reply.get.return_value = dict(self.driver_errors)
         else:
@@ -44,8 +58,9 @@ class FakeVolttron:
     def unsubscribe(self, peer, prefix, callback):
         self.subscriptions.pop(prefix, None)
 
-    def publish(self, peer, topic, message=None, **kwargs):
+    def publish(self, peer, topic, message=None, headers=None, **kwargs):
         self.published.append((topic, message))
+        self.published_with_headers.append((topic, message, headers or {}))
 
 
 @pytest.fixture
@@ -85,7 +100,7 @@ def test_configure_resolves_both_ends_and_subscribes_to_polls_and_pushes(world):
     configure(a)
     assert set(fake.subscriptions) == {'devices/site1/pv/all', 'devices/site1/pv/multi'}
     bridge = a.bridges['pv_to_mirror']
-    assert bridge.source_format == 'fake_pv' and bridge.target_format == 'fake_mirror' and bridge.rpc_topic == 'devices/site1/mirror'
+    assert bridge.source.format == 'fake_pv' and bridge.target.format == 'fake_mirror' and bridge.target.rpc_topic == 'devices/site1/mirror'
     assert [c[:2] for c in fake.calls] == [('platform.presentation', 'resolve')] * 2
     listed = a.list_bridges()
     assert listed[0]['name'] == 'pv_to_mirror' and listed[0]['source_topics'] == ['devices/site1/pv/all', 'devices/site1/pv/multi']
@@ -97,8 +112,8 @@ def test_a_publication_is_transformed_with_a_field_hinted_write_chain_and_writte
     configure(a)
     fake.subscriptions['devices/site1/pv/all']('pubsub', 'platform.driver', 'bus', 'devices/site1/pv/all', {},
                                                [{'W': 4321, 'Hz': 60}, {'W': {'units': 'W'}, 'Hz': {'units': 'Hz'}}])
-    chain_call = next(c for c in fake.calls if c[1] == 'resolve' and c[3].get('direction') == 'write')
-    assert chain_call[2] == (['site1', 'mirror'],) and chain_call[3] == {'as_format': 'fake_pv', 'direction': 'write', 'fields': ['W', 'Hz']}
+    chain_call = next(c for c in fake.calls if c[1] == 'transform_chain')
+    assert chain_call[2] == ('fake_pv', 'fake_mirror', ['W', 'Hz'])
     assert writes(fake) == [('devices/site1/mirror', {'M_W': 8642, 'M_Hz': 60})]
     topic, result = fake.published[-1]
     assert topic == 'device_adapter/pv_to_mirror' and result['written'] == {'M_W': 8642, 'M_Hz': 60} and result['errors'] == {}
@@ -109,7 +124,7 @@ def test_a_publication_is_transformed_with_a_field_hinted_write_chain_and_writte
     fake.subscriptions['devices/site1/pv/multi']('pubsub', 'platform.driver', 'bus', 'devices/site1/pv/multi', {}, [{'W': 5000}, {}])
     assert writes(fake)[-1] == ('devices/site1/mirror', {'M_W': 10000})
     # One chain per distinct field set, fetched from the service once.
-    assert len([c for c in fake.calls if c[1] == 'resolve' and c[3].get('direction') == 'write']) == 2
+    assert len([c for c in fake.calls if c[1] == 'transform_chain']) == 2
 
 
 def test_write_unchanged_and_point_filter(world):
@@ -175,3 +190,39 @@ def test_write_rpc_writes_a_protocol_message_to_a_device(world):
     with pytest.raises(ValueError):
         a.write(['site1', 'unknown'], {'W': 1}, as_format='fake_pv')
     assert a.relay_message('missing', {}) if False else True
+
+
+def test_bus_ends_publish_and_consume_openfmb_profiles(world):
+    """A device -> OpenFMB topic bridge publishes the profile with the on-bus headers; an OpenFMB topic -> device
+    bridge writes what arrives there, except what this agent published itself."""
+    from interoperability import openfmb_bus
+    a, fake = world
+    a.core.identity = 'platform.device_adapter'
+    a.configure_main(None, 'NEW', {'bridges': [
+        {'name': 'pv_reading', 'source': 'site1/pv', 'target': {'uai': READING, 'bus': True}},
+        {'name': 'pv_control', 'source': {'uai': CONTROL, 'bus': True}, 'target': 'site1/pv'}]})
+    assert set(fake.subscriptions) == {'devices/site1/pv/all', 'devices/site1/pv/multi', 'openfmb/solarmodule/SolarControlProfile/m-1'}
+    listed = {b['name']: b for b in a.list_bridges()}
+    assert listed['pv_reading']['target_bus'] and listed['pv_reading']['target_topic'] == 'openfmb/solarmodule/SolarReadingProfile/m-1'
+    assert listed['pv_control']['source_bus'] and listed['pv_control']['source_format'] == 'openfmb.solar.control'
+    # Device publication -> profile on the bus.
+    fake.subscriptions['devices/site1/pv/all']('pubsub', 'platform.driver', 'bus', 'devices/site1/pv/all', {}, [{'W': 4321}, {}])
+    topic, message, headers = next((t, m, h) for t, m, h in fake.published_with_headers if t.startswith('openfmb/'))
+    assert topic == 'openfmb/solarmodule/SolarReadingProfile/m-1'
+    assert message == {'solarReading': {'readingMMXU': {'W': {'net': {'cVal': {'mag': 4321}}}}}, 'solarInverter': {'conductingEquipment': {'mRID': 'm-1'}}}
+    assert openfmb_bus.is_openfmb(headers) and openfmb_bus.proto_of(headers) == 'solarmodule.SolarReadingProfile'
+    assert openfmb_bus.origin_of(headers) == 'platform.device_adapter'
+    assert writes(fake) == []                                                      # nothing was written to a device
+    report = fake.published[-1][1]
+    assert report['published'] is True and report['target'] == topic and report['path'] == ['fake_pv', 'openfmb.solar.reading']
+    # Profile on the bus -> device write; the agent's own publishes on that topic are ignored.
+    control = fake.subscriptions['openfmb/solarmodule/SolarControlProfile/m-1']
+    control('pubsub', 'bus_adapter', 'bus', 'openfmb/solarmodule/SolarControlProfile/m-1',
+            openfmb_bus.headers('solarmodule.SolarControlProfile', 'platform.bus_adapter'), {'solarControl': {'limitW': 50}})
+    assert writes(fake) == [('devices/site1/pv', {'LimPct': 50})]
+    control('pubsub', 'me', 'bus', 'openfmb/solarmodule/SolarControlProfile/m-1',
+            openfmb_bus.headers('solarmodule.SolarControlProfile', 'platform.device_adapter'), {'solarControl': {'limitW': 60}})
+    assert len(writes(fake)) == 1
+    chain_call = next(c for c in fake.calls if c[1] == 'transform_chain' and c[2][0] == 'openfmb.solar.control')
+    assert chain_call[2] == ('openfmb.solar.control', 'fake_pv', ['solarControl.limitW'])
+
