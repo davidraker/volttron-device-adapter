@@ -287,6 +287,7 @@ class DeviceAdapterAgent(Agent):
         if not isinstance(out, dict):
             _log.warning(f'Bridge {bridge.key}: the chain produced {type(out).__name__}, not a mapping; nothing written.')
             return None
+        out = {k: v for k, v in out.items() if v is not None}   # a point without a value is not a write
         if bridge.target.bus:
             return self._publish(bridge, topic, chain, out)
         if not bridge.config.write_unchanged:

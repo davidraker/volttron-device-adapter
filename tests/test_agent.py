@@ -269,3 +269,10 @@ def test_a_stopped_bridge_ignores_late_messages_even_if_unsubscribing_failed(wor
     a.configure_main(None, 'NEW', {'bridges': []})                      # stops the bridge; the fake refuses to drop it
     old_handle('pubsub', 'platform.driver', 'bus', 'devices/site1/pv/all', {}, [{'W': 10, 'Hz': 60}, {}])
     assert writes(fake) == []
+
+
+def test_none_values_are_not_written(world):
+    a, fake = world
+    configure(a)
+    fake.subscriptions['devices/site1/pv/all']('pubsub', 'platform.driver', 'bus', 'devices/site1/pv/all', {}, [{'W': 10, 'Hz': None}, {}])
+    assert writes(fake) == [('devices/site1/mirror', {'M_W': 20})]
