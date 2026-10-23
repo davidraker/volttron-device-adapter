@@ -38,6 +38,7 @@ operation here. Which points a device accepts is its interface's business; refus
 import logging
 import sys
 import time
+from gevent.lock import RLock
 
 from collections import OrderedDict
 from dataclasses import dataclass, field
@@ -134,6 +135,9 @@ class Bridge:
     chains: 'OrderedDict[frozenset, Chain]' = field(default_factory=OrderedDict)
     callbacks: list = field(default_factory=list)
     stopped: bool = False       # set by _stop_bridge; a late message on a subscription not yet dropped is ignored
+    # Relays of one bridge run in order, one at a time, in their own greenlets: a slow write (a batch of DNP3 operates
+    # can take minutes) must not hold the agent's subscription loop, which delivers every bridge's messages.
+    lock: 'RLock' = field(default_factory=lambda: RLock())
 
     @property
     def key(self) -> str:
@@ -246,7 +250,7 @@ class DeviceAdapterAgent(Agent):
         for topic in source.topics:
             def handle(peer, sender, bus, published_topic, headers, message, _bridge=bridge):
                 if not _bridge.stopped:
-                    self.relay(_bridge, published_topic, message, headers)
+                    self.core.spawn(self._relay_in_order, _bridge, published_topic, message, headers)
             self.vip.pubsub.subscribe(peer='pubsub', prefix=topic, callback=handle)
             bridge.callbacks.append((topic, handle))
         self.bridges[bridge.key] = bridge
@@ -264,6 +268,12 @@ class DeviceAdapterAgent(Agent):
         self.bridges.pop(bridge.key, None)
 
     # ---- relaying ------------------------------------------------------------------------------------------------
+    def _relay_in_order(self, bridge: Bridge, topic: str, message, headers: dict | None):
+        """One bridge's messages are relayed in the order received, each in its own greenlet (see Bridge.lock)."""
+        with bridge.lock:
+            if not bridge.stopped:
+                self.relay(bridge, topic, message, headers)
+
     def relay(self, bridge: Bridge, topic: str, message, headers: dict | None = None) -> WriteResult | None:
         """Bridge one message of the source: transform it into the target's format and write or publish it."""
         if bridge.source.bus and openfmb_bus.origin_of(headers) == self.identity:
