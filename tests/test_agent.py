@@ -228,9 +228,10 @@ def test_bus_ends_publish_and_consume_openfmb_profiles(world):
 
 
 
-def test_two_bridges_into_one_target_warn_and_each_writes_once(world, caplog):
-    """Two sources disagree on a point of one target: the operator is warned at configuration, and the target ends
-    up with the later value instead of flapping as each bridge restores its own at every poll."""
+def test_two_bridges_into_one_target_warn_and_the_conflict_stays_visible(world, caplog):
+    """Two sources disagree on a point of one target: the operator is warned at configuration, and because the
+    written-value memory is per target, each source's poll makes the other's value a change again, so the target
+    alternates visibly instead of one source being overridden in silence."""
     import logging
     a, fake = world
     fake.resources[('site1', 'pv2')] = {**SOURCE, 'publication_topic': 'devices/site1/pv2/all', 'rpc_topic': 'devices/site1/pv2'}
@@ -242,10 +243,10 @@ def test_two_bridges_into_one_target_warn_and_each_writes_once(world, caplog):
     for _ in range(3):
         first('pubsub', 'platform.driver', 'bus', 'devices/site1/pv/all', {}, [{'W': 10}, {}])
         second('pubsub', 'platform.driver', 'bus', 'devices/site1/pv2/all', {}, [{'W': 20}, {}])
-    assert writes(fake) == [('devices/site1/mirror', {'M_W': 20}), ('devices/site1/mirror', {'M_W': 40})]
-    # The same source changing is still written.
-    first('pubsub', 'platform.driver', 'bus', 'devices/site1/pv/all', {}, [{'W': 11}, {}])
-    assert writes(fake)[-1] == ('devices/site1/mirror', {'M_W': 22})
+    assert writes(fake) == [('devices/site1/mirror', {'M_W': 20}), ('devices/site1/mirror', {'M_W': 40})] * 3
+    # A source repeating a value the target already holds is still skipped.
+    second('pubsub', 'platform.driver', 'bus', 'devices/site1/pv2/all', {}, [{'W': 20}, {}])
+    assert len(writes(fake)) == 6
 
 
 def test_bridges_to_different_targets_do_not_warn(world, caplog):

@@ -287,11 +287,11 @@ class DeviceAdapterAgent(Agent):
         if bridge.target.bus:
             return self._publish(bridge, topic, chain, out)
         if not bridge.config.write_unchanged:
-            out = self._only_changes(bridge.key, out)
+            out = self._only_changes(bridge.target.key, out)
         if not out:
             return None
         result = self.writer.write(bridge.target.rpc_topic, out)
-        self._remember(bridge.key, bridge.target.key, result.written)
+        self._remember(bridge.target.key, result.written)
         self._report(bridge, topic, chain, {'target': bridge.target.rpc_topic, **result.as_dict()})
         if result.errors:
             _log.warning(f'Bridge {bridge.key}: {len(result.written)} written, {len(result.errors)} refused: '
@@ -342,19 +342,21 @@ class DeviceAdapterAgent(Agent):
             kept[point] = value
         return kept
 
-    def _only_changes(self, bridge_key: str, out: dict) -> dict:
-        """What this bridge has not already written. The memory is per bridge, not per target: two bridges feeding
-        one target with different values each write theirs once and the target keeps the later one, instead of each
-        bridge restoring its value over the other's at every poll."""
-        last = self._last_written.get(bridge_key, {})
+    def _only_changes(self, device: str, out: dict) -> dict:
+        """What has not already been written to this target, by any bridge. The memory is deliberately per target,
+        not per bridge: when two bridges feed one target values that disagree, each write of one makes the other's
+        value a change again, so the target visibly alternates between them at every poll. That flapping, together
+        with the shared-target warning at configuration, is how the conflict shows; a per-bridge memory would let the
+        later writer win silently and hide that one source's values are being overridden."""
+        last = self._last_written.get(device, {})
         return {k: v for k, v in out.items() if k == SEQUENCE or k not in last or not same_value(last[k], v)}
 
-    def _remember(self, bridge_key: str, device: str, written: dict):
+    def _remember(self, device: str, written: dict):
         if not written:
             return
         now = time.time()
-        recent = self._recent_writes.setdefault(device, {})         # echoes are per device: any bridge's write
-        last = self._last_written.setdefault(bridge_key, {})
+        recent = self._recent_writes.setdefault(device, {})
+        last = self._last_written.setdefault(device, {})
         for point, value in written.items():
             recent[point] = (value, now)
             last[point] = value
@@ -390,7 +392,7 @@ class DeviceAdapterAgent(Agent):
         if not isinstance(out, dict):
             raise ValueError(f'The chain to {resolved["data_format"]} produced {type(out).__name__}, not a device message.')
         result = self.writer.write(resolved['rpc_topic'], out)
-        self._remember('rpc', device_of(resolved['rpc_topic']), result.written)     # echoes of RPC writes are dropped too
+        self._remember(device_of(resolved['rpc_topic']), result.written)
         return {'target': resolved['rpc_topic'], 'path': list(resolved.get('path') or []), 'retention': resolved.get('retention'),
                 **result.as_dict()}
 
