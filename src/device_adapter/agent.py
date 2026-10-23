@@ -186,11 +186,25 @@ class DeviceAdapterAgent(Agent):
             self._stop_bridge(bridge)
         self.config = new_config
         self.writer = DeviceWriter(self._rpc, self.config.driver)
+        self._warn_shared_targets(self.config.bridges)
         for bridge_config in self.config.bridges:
             if bridge_config.enabled:
                 self.core.spawn(self._start_bridge, bridge_config)
         if getattr(self.core, 'connected', False):
             self.vip.health.set_status(STATUS_GOOD, f'{len(self.config.bridges)} bridge(s) configured.')
+
+    def _warn_shared_targets(self, bridges: list[BridgeConfig]):
+        """Two enabled bridges into one target may both produce the same target point; if their sources disagree the
+        target takes whichever wrote last. Which points, if any, overlap depends on the transforms, so the operator is
+        told about the shared target and decides."""
+        by_target: dict[str, list[str]] = {}
+        for bridge in bridges:
+            if bridge.enabled and not bridge.target.bus:
+                by_target.setdefault(bridge.target.key, []).append(bridge.key)
+        for target, names in by_target.items():
+            if len(names) > 1:
+                _log.warning(f'Bridges {", ".join(names)} all write to {target}: a point that more than one of them'
+                             f' produces holds the value of whichever source reported last.')
 
     def _resolve(self, uai: list[str], **kwargs) -> dict:
         return self._rpc(self.config.presentation_service, 'resolve', list(uai), **kwargs) or {}
@@ -273,11 +287,11 @@ class DeviceAdapterAgent(Agent):
         if bridge.target.bus:
             return self._publish(bridge, topic, chain, out)
         if not bridge.config.write_unchanged:
-            out = self._only_changes(bridge.target.key, out)
+            out = self._only_changes(bridge.key, out)
         if not out:
             return None
         result = self.writer.write(bridge.target.rpc_topic, out)
-        self._remember(bridge.target.key, result.written)
+        self._remember(bridge.key, bridge.target.key, result.written)
         self._report(bridge, topic, chain, {'target': bridge.target.rpc_topic, **result.as_dict()})
         if result.errors:
             _log.warning(f'Bridge {bridge.key}: {len(result.written)} written, {len(result.errors)} refused: '
@@ -328,16 +342,19 @@ class DeviceAdapterAgent(Agent):
             kept[point] = value
         return kept
 
-    def _only_changes(self, device: str, out: dict) -> dict:
-        last = self._last_written.get(device, {})
+    def _only_changes(self, bridge_key: str, out: dict) -> dict:
+        """What this bridge has not already written. The memory is per bridge, not per target: two bridges feeding
+        one target with different values each write theirs once and the target keeps the later one, instead of each
+        bridge restoring its value over the other's at every poll."""
+        last = self._last_written.get(bridge_key, {})
         return {k: v for k, v in out.items() if k == SEQUENCE or k not in last or not same_value(last[k], v)}
 
-    def _remember(self, device: str, written: dict):
+    def _remember(self, bridge_key: str, device: str, written: dict):
         if not written:
             return
         now = time.time()
-        recent = self._recent_writes.setdefault(device, {})
-        last = self._last_written.setdefault(device, {})
+        recent = self._recent_writes.setdefault(device, {})         # echoes are per device: any bridge's write
+        last = self._last_written.setdefault(bridge_key, {})
         for point, value in written.items():
             recent[point] = (value, now)
             last[point] = value
@@ -373,7 +390,7 @@ class DeviceAdapterAgent(Agent):
         if not isinstance(out, dict):
             raise ValueError(f'The chain to {resolved["data_format"]} produced {type(out).__name__}, not a device message.')
         result = self.writer.write(resolved['rpc_topic'], out)
-        self._remember(device_of(resolved['rpc_topic']), result.written)
+        self._remember('rpc', device_of(resolved['rpc_topic']), result.written)     # echoes of RPC writes are dropped too
         return {'target': resolved['rpc_topic'], 'path': list(resolved.get('path') or []), 'retention': resolved.get('retention'),
                 **result.as_dict()}
 

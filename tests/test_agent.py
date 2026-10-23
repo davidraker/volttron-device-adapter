@@ -226,3 +226,33 @@ def test_bus_ends_publish_and_consume_openfmb_profiles(world):
     chain_call = next(c for c in fake.calls if c[1] == 'transform_chain' and c[2][0] == 'openfmb.solar.control')
     assert chain_call[2] == ('openfmb.solar.control', 'fake_pv', ['solarControl.limitW'])
 
+
+
+def test_two_bridges_into_one_target_warn_and_each_writes_once(world, caplog):
+    """Two sources disagree on a point of one target: the operator is warned at configuration, and the target ends
+    up with the later value instead of flapping as each bridge restores its own at every poll."""
+    import logging
+    a, fake = world
+    fake.resources[('site1', 'pv2')] = {**SOURCE, 'publication_topic': 'devices/site1/pv2/all', 'rpc_topic': 'devices/site1/pv2'}
+    with caplog.at_level(logging.WARNING, logger=agent_module.__name__):
+        a.configure_main(None, 'NEW', {'bridges': [{'name': 'a', 'source': 'site1/pv', 'target': 'site1/mirror'},
+                                                   {'name': 'b', 'source': 'site1/pv2', 'target': 'site1/mirror'}]})
+    assert 'Bridges a, b all write to site1/mirror' in caplog.text
+    first, second = fake.subscriptions['devices/site1/pv/all'], fake.subscriptions['devices/site1/pv2/all']
+    for _ in range(3):
+        first('pubsub', 'platform.driver', 'bus', 'devices/site1/pv/all', {}, [{'W': 10}, {}])
+        second('pubsub', 'platform.driver', 'bus', 'devices/site1/pv2/all', {}, [{'W': 20}, {}])
+    assert writes(fake) == [('devices/site1/mirror', {'M_W': 20}), ('devices/site1/mirror', {'M_W': 40})]
+    # The same source changing is still written.
+    first('pubsub', 'platform.driver', 'bus', 'devices/site1/pv/all', {}, [{'W': 11}, {}])
+    assert writes(fake)[-1] == ('devices/site1/mirror', {'M_W': 22})
+
+
+def test_bridges_to_different_targets_do_not_warn(world, caplog):
+    import logging
+    a, fake = world
+    fake.resources[('site1', 'mirror2')] = {**TARGET, 'publication_topic': 'devices/site1/mirror2/all', 'rpc_topic': 'devices/site1/mirror2'}
+    with caplog.at_level(logging.WARNING, logger=agent_module.__name__):
+        a.configure_main(None, 'NEW', {'bridges': [{'name': 'a', 'source': 'site1/pv', 'target': 'site1/mirror'},
+                                                   {'name': 'b', 'source': 'site1/pv', 'target': 'site1/mirror2'}]})
+    assert 'all write to' not in caplog.text
