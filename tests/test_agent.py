@@ -257,3 +257,15 @@ def test_bridges_to_different_targets_do_not_warn(world, caplog):
         a.configure_main(None, 'NEW', {'bridges': [{'name': 'a', 'source': 'site1/pv', 'target': 'site1/mirror'},
                                                    {'name': 'b', 'source': 'site1/pv', 'target': 'site1/mirror2'}]})
     assert 'all write to' not in caplog.text
+
+
+def test_a_stopped_bridge_ignores_late_messages_even_if_unsubscribing_failed(world):
+    """Reconfiguration stops bridges; if the bus keeps a subscription alive (unsubscribe failed), a message that still
+    reaches the old handler must not be relayed."""
+    a, fake = world
+    configure(a)
+    old_handle = fake.subscriptions['devices/site1/pv/all']
+    fake.unsubscribe = lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError('bus unavailable'))
+    a.configure_main(None, 'NEW', {'bridges': []})                      # stops the bridge; the fake refuses to drop it
+    old_handle('pubsub', 'platform.driver', 'bus', 'devices/site1/pv/all', {}, [{'W': 10, 'Hz': 60}, {}])
+    assert writes(fake) == []

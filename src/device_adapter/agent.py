@@ -133,6 +133,7 @@ class Bridge:
     target: End
     chains: 'OrderedDict[frozenset, Chain]' = field(default_factory=OrderedDict)
     callbacks: list = field(default_factory=list)
+    stopped: bool = False       # set by _stop_bridge; a late message on a subscription not yet dropped is ignored
 
     @property
     def key(self) -> str:
@@ -244,7 +245,8 @@ class DeviceAdapterAgent(Agent):
         bridge = Bridge(config, source, target)
         for topic in source.topics:
             def handle(peer, sender, bus, published_topic, headers, message, _bridge=bridge):
-                self.relay(_bridge, published_topic, message, headers)
+                if not _bridge.stopped:
+                    self.relay(_bridge, published_topic, message, headers)
             self.vip.pubsub.subscribe(peer='pubsub', prefix=topic, callback=handle)
             bridge.callbacks.append((topic, handle))
         self.bridges[bridge.key] = bridge
@@ -253,11 +255,12 @@ class DeviceAdapterAgent(Agent):
         return bridge
 
     def _stop_bridge(self, bridge: Bridge):
+        bridge.stopped = True               # from here on its handlers ignore messages, whatever the unsubscribe does
         for topic, handle in bridge.callbacks:
             try:
                 self.vip.pubsub.unsubscribe(peer='pubsub', prefix=topic, callback=handle)
             except Exception as e:                                                    # pragma: no cover
-                _log.warning(f'Bridge {bridge.key}: unable to unsubscribe from {topic}: {e}')
+                _log.warning(f'Bridge {bridge.key}: unable to unsubscribe from {topic}: {e!r}')
         self.bridges.pop(bridge.key, None)
 
     # ---- relaying ------------------------------------------------------------------------------------------------
