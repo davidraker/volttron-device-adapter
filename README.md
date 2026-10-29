@@ -1,6 +1,6 @@
-# VOLTTRON Device Adapter
+# VOLTTRON Resource Bridge
 
-The Device Adapter agent bridges one VOLTTRON device into another across protocols. In the
+The Resource Bridge agent bridges one VOLTTRON device into another across protocols. In the
 vocabulary of OpenFMB, an *adapter* connects a protocol-speaking device to the common bus; the
 Message Bus Adapter does that between VOLTTRON and a foreign bus, and this agent does it between two
 devices behind the platform driver: a SunSpec inverter and the IEEE 2030.5 server the platform
@@ -18,8 +18,12 @@ refused points come back as errors on the bridge's result topic.
 The presentation service only answers mapping and transformation questions (`resolve` with
 `direction='write'` and a `fields` hint). The policy lives here:
 
-- change-only writes: a point is written when its value differs from the last one written to that
-  target (`write_unchanged` turns this off);
+- change-only writes: a point is written when its value differs from what the target device is known
+  to hold. That knowledge comes from the target's own publications (the agent subscribes to them),
+  from this agent's successful writes until the device reports, and, when `stale_after` is set,
+  from the driver's `last` RPC for points unknown or older than that many seconds. Comparing with
+  the device rather than with the last write means a point another writer changed is re-asserted by
+  the next source message (`write_unchanged` writes everything regardless);
 - echo suppression: a publication that merely confirms a value this agent wrote to that device
   within `echo_window` seconds is not bridged back, so a pair of bridges between two devices does
   not loop;
@@ -42,6 +46,7 @@ The presentation service only answers mapping and transformation questions (`res
     "presentation_service": "platform.presentation",
     "driver": "platform.driver",
     "echo_window": 5.0,
+    "stale_after": null,
     "bridges": [
         {"name": "pv_to_utility", "source": "site1/pv_inverter", "target": ["site1", "pv_sep2_server"]},
         {"name": "utility_to_pv", "source": "site1/pv_sep2_server", "target": "site1/pv_inverter",
@@ -70,6 +75,11 @@ from the foreign bus, and any OpenFMB-aware agent can publish or consume them.
      "target": "site1/pv_inverter"}
 ]}
 ```
+`stale_after` (seconds, unset by default) makes the agent ask the driver's `last` RPC for a target
+point whose last known value is older than that, or unknown, before deciding whether to write it;
+unset, the agent relies on the target's publications and its own writes. The tracking is done by
+`interoperability.resource.ResourceWriter`, one per target device.
+
 Served devices (a server the platform runs) must be declared with their own device format,
 generated with the discovery tools' `--served` flag, so the write edges into their inputs exist.
 

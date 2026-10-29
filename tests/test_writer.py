@@ -1,6 +1,6 @@
 from unittest import mock
 
-from device_adapter.writer import DeviceWriter
+from resource_bridge.writer import DeviceWriter
 
 
 def rpc(calls, errors_by_call=None, raise_on=None):

@@ -21,7 +21,7 @@
 #
 # ===----------------------------------------------------------------------===
 # }}}
-"""The Device Adapter Agent: bridges one VOLTTRON device into another, or into OpenFMB on the VOLTTRON bus.
+"""The Resource Bridge Agent: bridges one VOLTTRON device into another, or into OpenFMB on the VOLTTRON bus.
 
 A *bridge* has a source and a target. A device end is a device behind the platform driver: read from its publications
 (the ``devices/<device>/all`` polls and the ``/multi`` pushes a served device receives from its peer), written through
@@ -46,31 +46,32 @@ from typing import Any
 
 from pydantic import ValidationError
 
-from volttron.client import Agent
-from volttron.client.messaging.health import STATUS_BAD, STATUS_GOOD
-from volttron.client.vip.agent import RPC
-from volttron.utils import load_config, vip_main
+from importlib.metadata import distribution, PackageNotFoundError
+try:
+    distribution('volttron-core')
+    from volttron.client import Agent
+    from volttron.client.messaging.health import STATUS_BAD, STATUS_GOOD
+    from volttron.client.vip.agent import RPC
+    from volttron.utils import load_config, vip_main
+except PackageNotFoundError:
+    # The monolithic platform (and der-control-fastlib's compatibility layer) provide the same names here.
+    from volttron.platform.agent.utils import load_config, vip_main
+    from volttron.platform.messaging.health import STATUS_BAD, STATUS_GOOD
+    from volttron.platform.vip.agent import Agent, RPC
 
 from interoperability import openfmb_bus
+from interoperability.resource import ALL, MULTI, ResourceWriter, message_values, same_value
 from interoperability.transform_parser import TransformParser
 
-from .config import BridgeConfig, DeviceAdapterConfig, EndConfig
-from .writer import DeviceWriter, SEQUENCE, WriteResult
+from .config import BridgeConfig, ResourceBridgeConfig, EndConfig
+from .writer import DeviceWriter, WriteResult
 
 _log = logging.getLogger(__name__)
 __version__ = '2.0.0rc0'
 
-ALL, MULTI = 'all', 'multi'
-DEFAULT_IDENTITY = 'platform.device_adapter'
+DEFAULT_IDENTITY = 'platform.resource_bridge'
 
-
-def message_values(message) -> dict | None:
-    """The point values of a device publication: ``[values, meta]`` (the platform driver) or a bare ``{point: value}``."""
-    if isinstance(message, (list, tuple)) and message and isinstance(message[0], dict):
-        return dict(message[0])
-    if isinstance(message, dict):
-        return dict(message)
-    return None
+__all__ = ['ResourceBridgeAgent', 'device_of', 'leaf_fields', 'message_values', 'same_value']
 
 
 def leaf_fields(value, prefix: tuple = ()) -> list[str]:
@@ -80,14 +81,6 @@ def leaf_fields(value, prefix: tuple = ()) -> list[str]:
     if isinstance(value, list):
         return [f for i, v in enumerate(value) for f in leaf_fields(v, prefix + (str(i),))]
     return ['.'.join(prefix)] if prefix else []
-
-
-def same_value(a, b) -> bool:
-    if a == b:
-        return True
-    if isinstance(a, (int, float)) and isinstance(b, (int, float)) and not isinstance(a, bool) and not isinstance(b, bool):
-        return abs(a - b) <= 1e-9 * max(1.0, abs(a), abs(b))
-    return False
 
 
 def device_of(topic: str) -> str:
@@ -116,6 +109,7 @@ class End:
     rpc_topic: str | None = None            # device target: where set_multiple_points goes
     proto: str | None = None                # bus end: the protobuf message name for the headers
     parameters: dict = field(default_factory=dict)
+    publication_topic: str | None = None    # device target: where the device reports what it holds
 
     @property
     def bus(self) -> bool:
@@ -151,18 +145,19 @@ class Bridge:
                 'chains': [list(c.path) for c in self.chains.values()]}
 
 
-class DeviceAdapterAgent(Agent):
+class ResourceBridgeAgent(Agent):
     """Mirrors device publications into other devices, or OpenFMB profiles on the bus, through the service's chains."""
 
     def __init__(self, config_path: str | None = None, **kwargs):
         super().__init__(**kwargs)
-        self.config = DeviceAdapterConfig()
+        self.config = ResourceBridgeConfig()
         self.bridges: dict[str, Bridge] = {}
         self.writer = DeviceWriter(self._rpc, self.config.driver)
         # Values this agent wrote, by device then point: a publication that merely confirms one of them within
         # echo_window is not bridged back, which keeps a pair of bridges between two devices from looping.
         self._recent_writes: dict[str, dict[str, tuple[Any, float]]] = {}
-        self._last_written: dict[str, dict[str, Any]] = {}
+        # One ResourceWriter per target device: what the device is known to hold, so only differences are written.
+        self._writers: dict[str, ResourceWriter] = {}
         if config_path:
             self.vip.config.set_default('config', load_config(config_path))
         self.vip.config.subscribe(self.configure_main, ['NEW', 'UPDATE'], 'config')
@@ -183,12 +178,15 @@ class DeviceAdapterAgent(Agent):
 
     def configure_main(self, _, action: str, contents: dict):
         try:
-            new_config = DeviceAdapterConfig(**contents)
+            new_config = ResourceBridgeConfig(**contents)
         except (ValidationError, TypeError, ValueError) as e:
-            self._report_bad_status(f'Validation of the device adapter configuration failed: {e}')
+            self._report_bad_status(f'Validation of the resource bridge configuration failed: {e}')
             return
         for bridge in list(self.bridges.values()):
             self._stop_bridge(bridge)
+        for writer in self._writers.values():
+            writer.unsubscribe()
+        self._writers.clear()               # the driver identity or stale_after may have changed; knowledge is rebuilt
         self.config = new_config
         self.writer = DeviceWriter(self._rpc, self.config.driver)
         self._warn_shared_targets(self.config.bridges)
@@ -235,7 +233,22 @@ class DeviceAdapterAgent(Agent):
         if not resolved.get('rpc_topic'):
             self._report_bad_status(f'Bridge {bridge}: {end.key} leads to a resource without an rpc_topic; it cannot be written.')
             return None
-        return End(end, resolved['data_format'], [], resolved['rpc_topic'], None, dict(resolved.get('parameters') or {}))
+        return End(end, resolved['data_format'], [], resolved['rpc_topic'], None, dict(resolved.get('parameters') or {}),
+                   publication_topic=resolved.get('publication_topic'))
+
+    def _writer_for(self, device: str, rpc_topic: str, publication_topic: str | None) -> ResourceWriter:
+        """The change tracker of a target device, shared by every bridge into it and by the write RPC. The memory is
+        deliberately per target, not per bridge: when two bridges feed one target values that disagree, each write of
+        one makes the other's value a change again, so the target visibly alternates between them at every poll. That
+        flapping, together with the shared-target warning at configuration, is how the conflict shows; a per-bridge
+        memory would let the later writer win silently and hide that one source's values are being overridden."""
+        writer = self._writers.get(device)
+        if writer is None:
+            writer = ResourceWriter(self, rpc_topic, publication_topic, driver=self.config.driver,
+                                    stale_after=self.config.stale_after, rpc_timeout=self.config.rpc_timeout)
+            writer.subscribe()
+            self._writers[device] = writer
+        return writer
 
     def _start_bridge(self, config: BridgeConfig) -> Bridge | None:
         try:
@@ -247,6 +260,8 @@ class DeviceAdapterAgent(Agent):
         if source is None or target is None:
             return None
         bridge = Bridge(config, source, target)
+        if not target.bus:
+            self._writer_for(target.key, target.rpc_topic, target.publication_topic)   # start learning what it holds
         for topic in source.topics:
             def handle(peer, sender, bus, published_topic, headers, message, _bridge=bridge):
                 if not _bridge.stopped:
@@ -300,11 +315,12 @@ class DeviceAdapterAgent(Agent):
         out = {k: v for k, v in out.items() if v is not None}   # a point without a value is not a write
         if bridge.target.bus:
             return self._publish(bridge, topic, chain, out)
-        if not bridge.config.write_unchanged:
-            out = self._only_changes(bridge.target.key, out)
+        tracker = self._writer_for(bridge.target.key, bridge.target.rpc_topic, bridge.target.publication_topic)
+        out = tracker.select(out, force=bridge.config.write_unchanged)
         if not out:
             return None
         result = self.writer.write(bridge.target.rpc_topic, out)
+        tracker.record(result.written)
         self._remember(bridge.target.key, result.written)
         self._report(bridge, topic, chain, {'target': bridge.target.rpc_topic, **result.as_dict()})
         if result.errors:
@@ -356,24 +372,14 @@ class DeviceAdapterAgent(Agent):
             kept[point] = value
         return kept
 
-    def _only_changes(self, device: str, out: dict) -> dict:
-        """What has not already been written to this target, by any bridge. The memory is deliberately per target,
-        not per bridge: when two bridges feed one target values that disagree, each write of one makes the other's
-        value a change again, so the target visibly alternates between them at every poll. That flapping, together
-        with the shared-target warning at configuration, is how the conflict shows; a per-bridge memory would let the
-        later writer win silently and hide that one source's values are being overridden."""
-        last = self._last_written.get(device, {})
-        return {k: v for k, v in out.items() if k == SEQUENCE or k not in last or not same_value(last[k], v)}
-
     def _remember(self, device: str, written: dict):
+        """For echo suppression: what this agent just wrote to ``device``, and when."""
         if not written:
             return
         now = time.time()
         recent = self._recent_writes.setdefault(device, {})
-        last = self._last_written.setdefault(device, {})
         for point, value in written.items():
             recent[point] = (value, now)
-            last[point] = value
 
     # ---- RPC -----------------------------------------------------------------------------------------------------
     @RPC.export
@@ -406,13 +412,15 @@ class DeviceAdapterAgent(Agent):
         if not isinstance(out, dict):
             raise ValueError(f'The chain to {resolved["data_format"]} produced {type(out).__name__}, not a device message.')
         result = self.writer.write(resolved['rpc_topic'], out)
-        self._remember(device_of(resolved['rpc_topic']), result.written)
+        device = device_of(resolved['rpc_topic'])
+        self._writer_for(device, resolved['rpc_topic'], resolved.get('publication_topic')).record(result.written)
+        self._remember(device, result.written)
         return {'target': resolved['rpc_topic'], 'path': list(resolved.get('path') or []), 'retention': resolved.get('retention'),
                 **result.as_dict()}
 
 
 def main():
-    vip_main(DeviceAdapterAgent, identity=DEFAULT_IDENTITY, version=__version__)
+    vip_main(ResourceBridgeAgent, identity=DEFAULT_IDENTITY, version=__version__)
 
 
 if __name__ == '__main__':

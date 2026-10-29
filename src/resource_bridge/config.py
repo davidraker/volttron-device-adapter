@@ -21,7 +21,7 @@
 #
 # ===----------------------------------------------------------------------===
 # }}}
-"""Configuration of the Device Adapter: which device publications are bridged into which devices."""
+"""Configuration of the Resource Bridge: which device publications are bridged into which devices."""
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
@@ -82,7 +82,7 @@ class BridgeConfig(BaseModel):
         return self.name or f'{self.source.key}>{self.target.key}'
 
 
-class DeviceAdapterConfig(BaseModel):
+class ResourceBridgeConfig(BaseModel):
     model_config = ConfigDict(validate_assignment=True, populate_by_name=True, extra='forbid')
 
     presentation_service: str = Field(default='platform.presentation', description='VIP identity of the interoperability'
@@ -92,10 +92,15 @@ class DeviceAdapterConfig(BaseModel):
     echo_window: float = Field(default=5.0, ge=0, description='Seconds during which a publication that merely confirms a'
                                                               ' value this agent wrote to that device is not bridged back.')
     rpc_timeout: float = Field(default=10.0, gt=0)
-    result_topic_prefix: str = Field(default='device_adapter', description='Each bridge publishes the outcome of every'
+    result_topic_prefix: str = Field(default='resource_bridge', description='Each bridge publishes the outcome of every'
                                                                            ' write on <prefix>/<bridge key>.')
     chain_cache_size: int = Field(default=32, ge=1, description='Chains kept per bridge, one per distinct set of fields'
                                                                 ' a publication carried.')
+    stale_after: float | None = Field(default=None, ge=0,
+                                      description='Before deciding whether a target point needs writing, ask the driver'
+                                                  ' (its last RPC) for points whose last known value is older than this'
+                                                  ' many seconds or unknown. Unset: rely on the target\'s publications'
+                                                  ' and this agent\'s own writes only.')
 
     @model_validator(mode='after')
     def _unique_keys(self):

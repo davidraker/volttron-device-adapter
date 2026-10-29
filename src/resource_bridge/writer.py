@@ -29,9 +29,7 @@ from typing import Any, Callable
 
 _log = logging.getLogger(__name__)
 
-#: The key under which a device-format message carries ordered write batches (curve writes), see the service's
-#: ``dnp3_device_transforms``: each batch is a flat ``{point: value}`` mapping whose key order is the write order.
-SEQUENCE = 'sequence'
+from interoperability.resource import SEQUENCE     # the key of ordered write batches (curve writes)
 
 
 @dataclass

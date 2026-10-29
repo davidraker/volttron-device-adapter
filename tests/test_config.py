@@ -1,11 +1,11 @@
 import pytest
 from pydantic import ValidationError
 
-from device_adapter.config import BridgeConfig, DeviceAdapterConfig
+from resource_bridge.config import BridgeConfig, ResourceBridgeConfig
 
 
 def test_default_config_is_idle():
-    config = DeviceAdapterConfig()
+    config = ResourceBridgeConfig()
     assert config.bridges == [] and config.presentation_service == 'platform.presentation' and config.driver == 'platform.driver'
 
 
@@ -25,8 +25,8 @@ def test_bad_uais_and_unknown_keys_are_rejected():
 
 def test_bridge_keys_must_be_unique():
     with pytest.raises(ValidationError):
-        DeviceAdapterConfig(bridges=[{'source': 'a', 'target': 'b'}, {'source': 'a', 'target': 'b'}])
-    config = DeviceAdapterConfig(bridges=[{'source': 'a', 'target': 'b'}, {'name': 'again', 'source': 'a', 'target': 'b'}], echo_window=0)
+        ResourceBridgeConfig(bridges=[{'source': 'a', 'target': 'b'}, {'source': 'a', 'target': 'b'}])
+    config = ResourceBridgeConfig(bridges=[{'source': 'a', 'target': 'b'}, {'name': 'again', 'source': 'a', 'target': 'b'}], echo_window=0)
     assert [b.key for b in config.bridges] == ['a>b', 'again'] and config.echo_window == 0
 
 

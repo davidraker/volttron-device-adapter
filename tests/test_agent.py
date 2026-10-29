@@ -1,11 +1,11 @@
-"""The Device Adapter Agent with VOLTTRON's Agent machinery stubbed out: bridges resolve through the presentation
+"""The Resource Bridge Agent with VOLTTRON's Agent machinery stubbed out: bridges resolve through the presentation
 service, subscribe to the source's publications and write the chain's output through the driver."""
 from unittest import mock
 
 import pytest
 
-from device_adapter import agent as agent_module
-from device_adapter.agent import DeviceAdapterAgent, device_of, leaf_fields, message_values
+from resource_bridge import agent as agent_module
+from resource_bridge.agent import ResourceBridgeAgent, device_of, leaf_fields, message_values
 
 SOURCE = {'data_format': 'fake_pv', 'publication_topic': 'devices/site1/pv/all', 'rpc_topic': 'devices/site1/pv', 'parameters': {}}
 TARGET = {'data_format': 'fake_mirror', 'publication_topic': 'devices/site1/mirror/all', 'rpc_topic': 'devices/site1/mirror',
@@ -20,6 +20,16 @@ READING = ['openfmb', 'solarmodule', 'SolarReadingProfile', 'm-1']
 CONTROL = ['openfmb', 'solarmodule', 'SolarControlProfile', 'm-1']
 
 
+class Subscribers:
+    """Every callback subscribed to one prefix; calling it delivers a message to all of them, as the bus does."""
+    def __init__(self):
+        self.callbacks = []
+
+    def __call__(self, *args):
+        for callback in list(self.callbacks):
+            callback(*args)
+
+
 class FakeVolttron:
     """Records RPCs, subscriptions and publishes; answers resolve and set_multiple_points."""
     def __init__(self):
@@ -30,6 +40,7 @@ class FakeVolttron:
                           tuple(CONTROL): {**SOURCE, 'target_format': 'openfmb.solar.control', 'parameters': {'mrid': 'm-1'},
                                            'codec': {'encoding': 'protobuf', 'proto': 'solarmodule.SolarControlProfile'}}}
         self.driver_errors = {}
+        self.last_values = {}              # what the driver's last RPC reports, by point topic
 
     def rpc_call(self, peer, method, *args, **kwargs):
         self.calls.append((peer, method, args, kwargs))
@@ -48,15 +59,21 @@ class FakeVolttron:
             reply.get.return_value = {'transform': chain, 'path': [src, dst], 'retention': 0.5}
         elif method == 'set_multiple_points':
             reply.get.return_value = dict(self.driver_errors)
+        elif method == 'last':
+            reply.get.return_value = {k: v for k, v in self.last_values.items() if k in args[0]}
         else:
             reply.get.return_value = None
         return reply
 
     def subscribe(self, peer, prefix, callback):
-        self.subscriptions[prefix] = callback
+        self.subscriptions.setdefault(prefix, Subscribers()).callbacks.append(callback)
 
     def unsubscribe(self, peer, prefix, callback):
-        self.subscriptions.pop(prefix, None)
+        subscribers = self.subscriptions.get(prefix)
+        if subscribers and callback in subscribers.callbacks:
+            subscribers.callbacks.remove(callback)
+        if subscribers is not None and not subscribers.callbacks:
+            self.subscriptions.pop(prefix, None)
 
     def publish(self, peer, topic, message=None, headers=None, **kwargs):
         self.published.append((topic, message))
@@ -67,12 +84,12 @@ class FakeVolttron:
 def world():
     fake = FakeVolttron()
     with mock.patch.object(agent_module.Agent, '__init__', return_value=None):
-        a = DeviceAdapterAgent.__new__(DeviceAdapterAgent)
+        a = ResourceBridgeAgent.__new__(ResourceBridgeAgent)
         a.vip = mock.MagicMock()
         a.core = mock.MagicMock()
         a.core.connected = True
         a.core.spawn.side_effect = lambda fn, *args: fn(*args)
-        DeviceAdapterAgent.__init__(a, config_path=None)
+        ResourceBridgeAgent.__init__(a, config_path=None)
     a.vip.rpc.call.side_effect = fake.rpc_call
     a.vip.pubsub.subscribe.side_effect = fake.subscribe
     a.vip.pubsub.unsubscribe.side_effect = fake.unsubscribe
@@ -98,7 +115,8 @@ def test_helpers():
 def test_configure_resolves_both_ends_and_subscribes_to_polls_and_pushes(world):
     a, fake = world
     configure(a)
-    assert set(fake.subscriptions) == {'devices/site1/pv/all', 'devices/site1/pv/multi'}
+    # The source's polls and pushes feed the bridge; the target's tell the agent what the target holds.
+    assert set(fake.subscriptions) == {'devices/site1/pv/all', 'devices/site1/pv/multi', 'devices/site1/mirror/all', 'devices/site1/mirror/multi'}
     bridge = a.bridges['pv_to_mirror']
     assert bridge.source.format == 'fake_pv' and bridge.target.format == 'fake_mirror' and bridge.target.rpc_topic == 'devices/site1/mirror'
     assert [c[:2] for c in fake.calls] == [('platform.presentation', 'resolve')] * 2
@@ -116,7 +134,7 @@ def test_a_publication_is_transformed_with_a_field_hinted_write_chain_and_writte
     assert chain_call[2] == ('fake_pv', 'fake_mirror', ['W', 'Hz'])
     assert writes(fake) == [('devices/site1/mirror', {'M_W': 8642, 'M_Hz': 60})]
     topic, result = fake.published[-1]
-    assert topic == 'device_adapter/pv_to_mirror' and result['written'] == {'M_W': 8642, 'M_Hz': 60} and result['errors'] == {}
+    assert topic == 'resource_bridge/pv_to_mirror' and result['written'] == {'M_W': 8642, 'M_Hz': 60} and result['errors'] == {}
     assert result['path'] == ['fake_pv', 'fake_mirror'] and result['retention'] == 0.5 and result['source'] == 'devices/site1/pv/all'
     # The same values again: nothing changed at the target, so nothing is written; a change is.
     fake.subscriptions['devices/site1/pv/multi']('pubsub', 'platform.driver', 'bus', 'devices/site1/pv/multi', {}, [{'W': 4321}, {}])
@@ -197,7 +215,7 @@ def test_bus_ends_publish_and_consume_openfmb_profiles(world):
     bridge writes what arrives there, except what this agent published itself."""
     from interoperability import openfmb_bus
     a, fake = world
-    a.core.identity = 'platform.device_adapter'
+    a.core.identity = 'platform.resource_bridge'
     a.configure_main(None, 'NEW', {'bridges': [
         {'name': 'pv_reading', 'source': 'site1/pv', 'target': {'uai': READING, 'bus': True}},
         {'name': 'pv_control', 'source': {'uai': CONTROL, 'bus': True}, 'target': 'site1/pv'}]})
@@ -211,7 +229,7 @@ def test_bus_ends_publish_and_consume_openfmb_profiles(world):
     assert topic == 'openfmb/solarmodule/SolarReadingProfile/m-1'
     assert message == {'solarReading': {'readingMMXU': {'W': {'net': {'cVal': {'mag': 4321}}}}}, 'solarInverter': {'conductingEquipment': {'mRID': 'm-1'}}}
     assert openfmb_bus.is_openfmb(headers) and openfmb_bus.proto_of(headers) == 'solarmodule.SolarReadingProfile'
-    assert openfmb_bus.origin_of(headers) == 'platform.device_adapter'
+    assert openfmb_bus.origin_of(headers) == 'platform.resource_bridge'
     assert writes(fake) == []                                                      # nothing was written to a device
     report = fake.published[-1][1]
     assert report['published'] is True and report['target'] == topic and report['path'] == ['fake_pv', 'openfmb.solar.reading']
@@ -221,7 +239,7 @@ def test_bus_ends_publish_and_consume_openfmb_profiles(world):
             openfmb_bus.headers('solarmodule.SolarControlProfile', 'platform.bus_adapter'), {'solarControl': {'limitW': 50}})
     assert writes(fake) == [('devices/site1/pv', {'LimPct': 50})]
     control('pubsub', 'me', 'bus', 'openfmb/solarmodule/SolarControlProfile/m-1',
-            openfmb_bus.headers('solarmodule.SolarControlProfile', 'platform.device_adapter'), {'solarControl': {'limitW': 60}})
+            openfmb_bus.headers('solarmodule.SolarControlProfile', 'platform.resource_bridge'), {'solarControl': {'limitW': 60}})
     assert len(writes(fake)) == 1
     chain_call = next(c for c in fake.calls if c[1] == 'transform_chain' and c[2][0] == 'openfmb.solar.control')
     assert chain_call[2] == ('openfmb.solar.control', 'fake_pv', ['solarControl.limitW'])
@@ -276,3 +294,39 @@ def test_none_values_are_not_written(world):
     configure(a)
     fake.subscriptions['devices/site1/pv/all']('pubsub', 'platform.driver', 'bus', 'devices/site1/pv/all', {}, [{'W': 10, 'Hz': None}, {}])
     assert writes(fake) == [('devices/site1/mirror', {'M_W': 20})]
+
+
+def test_a_target_changed_by_someone_else_is_written_again(world):
+    """Change detection compares with what the target device holds, not with what this agent last wrote: when another
+    writer moves a point, the next source message carrying the intended value re-asserts it."""
+    a, fake = world
+    configure(a)
+    pv = fake.subscriptions['devices/site1/pv/all']
+    pv('pubsub', 'platform.driver', 'bus', 'devices/site1/pv/all', {}, [{'W': 4321, 'Hz': 60}, {}])
+    pv('pubsub', 'platform.driver', 'bus', 'devices/site1/pv/all', {}, [{'W': 4321, 'Hz': 60}, {}])
+    assert writes(fake) == [('devices/site1/mirror', {'M_W': 8642, 'M_Hz': 60})]          # repeat: nothing to do
+    # The mirror reports a different M_W (a remote master wrote it); M_Hz is as we left it.
+    fake.subscriptions['devices/site1/mirror/all']('pubsub', 'platform.driver', 'bus', 'devices/site1/mirror/all', {}, [{'M_W': 5, 'M_Hz': 60}, {}])
+    pv('pubsub', 'platform.driver', 'bus', 'devices/site1/pv/all', {}, [{'W': 4321, 'Hz': 60}, {}])
+    assert writes(fake)[-1] == ('devices/site1/mirror', {'M_W': 8642})
+    assert a._writers['site1/mirror'].drifted() == {}                                       # re-asserted, in step again
+
+
+def test_stale_after_asks_the_driver_before_the_first_write(world):
+    a, fake = world
+    fake.last_values = {'devices/site1/mirror/M_W': {'value': 8642, 'updated': '2026-10-26T12:00:00+00:00'},
+                        'devices/site1/mirror/M_Hz': {'value': None, 'updated': None}}     # never seen by the driver
+    a.configure_main(None, 'NEW', {'stale_after': 30,
+                                   'bridges': [{'name': 'pv_to_mirror', 'source': 'site1/pv', 'target': ['site1', 'mirror']}]})
+    fake.subscriptions['devices/site1/pv/all']('pubsub', 'platform.driver', 'bus', 'devices/site1/pv/all', {}, [{'W': 4321, 'Hz': 60}, {}])
+    last_call = next(c for c in fake.calls if c[1] == 'last')
+    assert last_call[0] == 'platform.driver' and sorted(last_call[2][0]) == ['devices/site1/mirror/M_Hz', 'devices/site1/mirror/M_W']
+    assert writes(fake) == [('devices/site1/mirror', {'M_Hz': 60})]                        # M_W already there; M_Hz unknown
+
+
+def test_reconfiguration_drops_the_target_subscriptions_too(world):
+    a, fake = world
+    configure(a)
+    assert 'devices/site1/mirror/multi' in fake.subscriptions
+    a.configure_main(None, 'UPDATE', {'bridges': []})
+    assert fake.subscriptions == {} and a._writers == {}
