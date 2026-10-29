@@ -132,6 +132,10 @@ class Bridge:
     # Relays of one bridge run in order, one at a time, in their own greenlets: a slow write (a batch of DNP3 operates
     # can take minutes) must not hold the agent's subscription loop, which delivers every bridge's messages.
     lock: 'RLock' = field(default_factory=lambda: RLock())
+    # Counters for the statistics RPC: what this bridge has seen and done since it was started.
+    stats: dict = field(default_factory=lambda: {'messages': 0, 'transform_errors': 0, 'writes': 0, 'publishes': 0,
+                                                 'points_written': 0, 'points_skipped': 0, 'points_refused': 0,
+                                                 'last_message': None, 'last_write': None, 'last_error': None})
 
     @property
     def key(self) -> str:
@@ -294,6 +298,8 @@ class ResourceBridgeAgent(Agent):
         if bridge.source.bus and openfmb_bus.origin_of(headers) == self.identity:
             return None                                                   # our own publish on a topic we also read
         values = message_values(message)
+        bridge.stats['messages'] += 1
+        bridge.stats['last_message'] = time.time()
         if values is None:
             _log.warning(f'Bridge {bridge.key}: ignoring a message on {topic} that is not a mapping: {type(message).__name__}')
             return None
@@ -307,6 +313,8 @@ class ResourceBridgeAgent(Agent):
             chain = self._chain_for(bridge, values)
             out = chain.transform.execute(values)
         except Exception as e:
+            bridge.stats['transform_errors'] += 1
+            bridge.stats['last_error'] = f'{type(e).__name__}: {e}'
             _log.warning(f'Bridge {bridge.key}: unable to transform {len(values)} fields from {topic}: {e!r}')
             return None
         if not isinstance(out, dict):
@@ -316,10 +324,18 @@ class ResourceBridgeAgent(Agent):
         if bridge.target.bus:
             return self._publish(bridge, topic, chain, out)
         tracker = self._writer_for(bridge.target.key, bridge.target.rpc_topic, bridge.target.publication_topic)
+        candidates = len(out)
         out = tracker.select(out, force=bridge.config.write_unchanged)
+        bridge.stats['points_skipped'] += candidates - len(out)
         if not out:
             return None
         result = self.writer.write(bridge.target.rpc_topic, out)
+        bridge.stats['writes'] += 1
+        bridge.stats['points_written'] += len(result.written)
+        bridge.stats['points_refused'] += len(result.errors)
+        bridge.stats['last_write'] = time.time()
+        if result.errors:
+            bridge.stats['last_error'] = next(iter(result.errors.values()))
         tracker.record(result.written)
         self._remember(bridge.target.key, result.written)
         self._report(bridge, topic, chain, {'target': bridge.target.rpc_topic, **result.as_dict()})
@@ -335,6 +351,9 @@ class ResourceBridgeAgent(Agent):
         target_topic = bridge.target.topics[0]
         self.vip.pubsub.publish('pubsub', topic=target_topic, headers=openfmb_bus.headers(bridge.target.proto, self.identity), message=out)
         result = WriteResult(written={k: v for k, v in out.items()})
+        bridge.stats['publishes'] += 1
+        bridge.stats['points_written'] += len(out)
+        bridge.stats['last_write'] = time.time()
         self._report(bridge, topic, chain, {'target': target_topic, 'published': True, **result.as_dict()})
         return result
 
@@ -388,6 +407,21 @@ class ResourceBridgeAgent(Agent):
         active = {b.key: b.describe() for b in self.bridges.values()}
         return [active.get(c.key, {'name': c.key, 'source': c.source.uai, 'target': c.target.uai, 'enabled': c.enabled, 'active': False})
                 for c in self.config.bridges]
+
+    @RPC.export
+    def statistics(self) -> dict:
+        """Per bridge, what it has seen and done since it started: messages received, transform errors, writes and
+        publishes, points written, skipped (the target already held the value) and refused, the times of the last
+        message, write and error, and the target points another writer has moved away from the intended value."""
+        report = {}
+        for key, bridge in self.bridges.items():
+            drifted = {}
+            if not bridge.target.bus and bridge.target.key in self._writers:
+                drifted = {point: {'intended': intended, 'actual': actual}
+                           for point, (intended, actual) in self._writers[bridge.target.key].drifted().items()}
+            report[key] = {**bridge.stats, 'enabled': bridge.config.enabled, 'source': bridge.config.source.uai,
+                           'target': bridge.config.target.uai, 'target_bus': bridge.target.bus, 'drifted': drifted}
+        return report
 
     @RPC.export
     def relay_message(self, bridge: str, message, headers: dict | None = None) -> dict:

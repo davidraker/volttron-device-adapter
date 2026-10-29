@@ -99,3 +99,7 @@ interoperability service's end-to-end matrix with this agent doing the writes fo
 device-to-device path, and once more with OpenFMB on the VOLTTRON bus (this agent's bus ends plus the
 Message Bus Adapter in relay mode) carrying the OpenFMB paths; it needs the modular driver stack and the Modbus, DNP3 and 2030.5 proxies
 importable and is skipped otherwise.
+
+The `statistics` RPC reports, per bridge, messages received, transform errors, writes and publishes, points
+written, skipped (the target already held the value) and refused, the times of the last message, write and
+error, and the target points another writer has moved away from the intended value.

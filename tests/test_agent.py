@@ -330,3 +330,16 @@ def test_reconfiguration_drops_the_target_subscriptions_too(world):
     assert 'devices/site1/mirror/multi' in fake.subscriptions
     a.configure_main(None, 'UPDATE', {'bridges': []})
     assert fake.subscriptions == {} and a._writers == {}
+
+
+def test_statistics_count_messages_writes_skips_and_drift(world):
+    a, fake = world
+    configure(a)
+    fake.subscriptions['devices/site1/pv/all']('pubsub', 'platform.driver', 'bus', 'devices/site1/pv/all', {},
+                                               [{'W': 4321, 'Hz': 60}, {'W': {'units': 'W'}, 'Hz': {'units': 'Hz'}}])
+    fake.subscriptions['devices/site1/pv/multi']('pubsub', 'platform.driver', 'bus', 'devices/site1/pv/multi', {}, [{'W': 4321}, {}])
+    stats = a.statistics()['pv_to_mirror']
+    assert stats['messages'] == 2 and stats['writes'] == 1 and stats['points_written'] == 2 and stats['points_refused'] == 0
+    assert stats['points_skipped'] == 1                      # the repeated W was already held by the target
+    assert stats['last_message'] and stats['last_write'] and stats['last_error'] is None and stats['transform_errors'] == 0
+    assert stats['enabled'] and stats['target'] == ['site1', 'mirror'] and stats['target_bus'] is False and stats['drifted'] == {}
